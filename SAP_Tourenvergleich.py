@@ -233,14 +233,14 @@ def merge_customer_info(base: Dict[str, Dict[str, str]], sap: str, info: Dict[st
 # ---------------------------------------------------------------------------
 
 
-def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int]:
+def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], Set[str], str, int]:
     """SAP Ist-Stand: Fallback A = SAP, G = Liefertag."""
     excel = pd.ExcelFile(uploaded_file)
     sheet_name = excel.sheet_names[0]
     df = read_excel_with_detected_header(excel, sheet_name)
 
     if df.empty:
-        return {}, sheet_name, 0
+        return {}, set(), sheet_name, 0
 
     columns = list(df.columns)
     sap_column = pick_column_by_name_or_position(
@@ -255,11 +255,16 @@ def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int]:
     )
 
     if sap_column is None or day_column is None:
-        return {}, sheet_name, 0
+        return {}, set(), sheet_name, 0
 
     work = df[[sap_column, day_column]].copy()
     work.columns = ["sap", "tag"]
     work["sap"] = normalize_sap_series(work["sap"])
+
+    # Kundenbestand unabhängig vom Liefertag erfassen. So kann eindeutig
+    # unterschieden werden: Kunde fehlt komplett in SAP vs. Liefertag weicht ab.
+    sap_customers: Set[str] = set(work.loc[work["sap"].ne(""), "sap"].tolist())
+
     work["tag_num"] = normalize_day_code_series(work["tag"])
 
     mask = (
@@ -271,7 +276,7 @@ def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int]:
     filtered["tag_int"] = filtered["tag_num"].astype(int)
 
     days_by_sap: Dict[str, Set[int]] = filtered.groupby("sap")["tag_int"].agg(set).to_dict()
-    return days_by_sap, sheet_name, len(filtered)
+    return days_by_sap, sap_customers, sheet_name, len(filtered)
 
 
 def read_tourenplanung(
@@ -404,6 +409,7 @@ RESULT_COLUMNS = [
 def build_sap_differences(
     tour_df: pd.DataFrame,
     days_by_sap: Dict[str, Set[int]],
+    sap_customers: Set[str],
     customer_info: Dict[str, Dict[str, str]],
 ) -> pd.DataFrame:
     """
@@ -421,6 +427,24 @@ def build_sap_differences(
     rows: List[dict] = []
 
     for sap, expected_days in expected_by_sap.items():
+        info = customer_info.get(sap, {})
+
+        # Nur diese Richtung wird bei der Kundenprüfung betrachtet:
+        # Tourendatei -> SAP. Kunden, die nur in SAP stehen, werden ignoriert.
+        if sap not in sap_customers:
+            rows.append({
+                "Blatt": sheets_by_sap.get(sap, ""),
+                "SAP Nummer": sap,
+                "Name": info.get("name", ""),
+                "Straße": info.get("strasse", ""),
+                "Ort": info.get("ort", ""),
+                "Tourenplanung (Soll)": days_to_text(expected_days) or "–",
+                "SAP (Ist)": "Kunde fehlt",
+                "SAP-Abweichung": "Kunde fehlt in SAP",
+                "_sort": int(sap) if str(sap).isdigit() else 9_999_999_999,
+            })
+            continue
+
         actual_days = days_by_sap.get(sap, set())
         missing_in_sap = sorted(expected_days - actual_days)
         extra_in_sap = sorted(actual_days - expected_days)
@@ -434,7 +458,6 @@ def build_sap_differences(
         if extra_in_sap:
             parts.append(f"Zusätzlich in SAP: {days_to_text(extra_in_sap)}")
 
-        info = customer_info.get(sap, {})
         rows.append({
             "Blatt": sheets_by_sap.get(sap, ""),
             "SAP Nummer": sap,
@@ -558,7 +581,8 @@ st.markdown(
     <div class="hint">
     <b>Grundlage ist ausschließlich die Tourenplanung.</b><br>
     Die Tourenplanung ist der Soll-Stand. Angezeigt wird nur, wo <b>SAP davon abweicht</b>.
-    Kunden, die nur in SAP stehen und nicht in der Tourenplanung vorkommen, werden bewusst ignoriert.
+    Zusätzlich wird geprüft, ob <b>jeder Kunde aus der Tourendatei überhaupt in SAP vorhanden ist</b>.
+    Geprüft wird nur Tourendatei → SAP; Kunden, die nur in SAP stehen, werden ignoriert.
     </div>
     """,
     unsafe_allow_html=True,
@@ -592,7 +616,7 @@ if run:
 
     try:
         tour_df, tour_sheets, missing_tour_sheets, customer_info = read_tourenplanung(tourenplanung_datei)
-        days_by_sap, sap_sheet, sap_rows = read_sap_file(sap_datei)
+        days_by_sap, sap_customers, sap_sheet, sap_rows = read_sap_file(sap_datei)
 
         if tour_df.empty:
             st.error("In der Tourenplanung wurden keine gültigen Liefertage erkannt.")
@@ -602,11 +626,14 @@ if run:
         if missing_tour_sheets:
             st.warning("Nicht gefundene Touren-Blätter: " + ", ".join(missing_tour_sheets))
 
-        differences = build_sap_differences(tour_df, days_by_sap, customer_info)
+        differences = build_sap_differences(tour_df, days_by_sap, sap_customers, customer_info)
         excel_bytes = build_excel(differences)
+
+        missing_customers = int((differences["SAP-Abweichung"] == "Kunde fehlt in SAP").sum()) if not differences.empty else 0
 
         st.session_state["sap_compare_result"] = {
             "differences": differences,
+            "missing_customers": missing_customers,
             "excel_bytes": excel_bytes,
             "tour_sheets": tour_sheets,
             "sap_sheet": sap_sheet,
@@ -641,7 +668,14 @@ if result:
             use_container_width=True,
         )
 
-    st.metric("SAP-Abweichungen", len(differences))
+    m1, m2 = st.columns(2)
+    m1.metric("SAP-Abweichungen", len(differences))
+    m2.metric("Kunden fehlen in SAP", result.get("missing_customers", 0))
+
+    if result.get("missing_customers", 0) == 0:
+        st.success("Alle Kunden aus der Tourendatei sind in SAP vorhanden.")
+    else:
+        st.error(f"{result['missing_customers']} Kunde(n) aus der Tourendatei fehlen komplett in SAP.")
 
     if differences.empty:
         st.success("Keine Abweichungen: SAP stimmt mit der Tourenplanung überein.")
