@@ -1,6 +1,7 @@
 import base64
 import html
 import io
+import hashlib
 from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
@@ -221,6 +222,13 @@ def normalize_day_code_series(series: pd.Series) -> pd.Series:
 
 def days_to_text(days: Set[int] | List[int]) -> str:
     return ", ".join(DAY_SHORT[d] for d in sorted(days))
+
+
+def uploaded_file_fingerprint(uploaded_file) -> str:
+    """Eindeutiger Fingerabdruck des aktuell hochgeladenen Dateiinhalts."""
+    if uploaded_file is None:
+        return ""
+    return hashlib.sha256(uploaded_file.getvalue()).hexdigest()
 
 
 def merge_customer_info(base: Dict[str, Dict[str, str]], sap: str, info: Dict[str, str]) -> None:
@@ -877,6 +885,25 @@ with upload_right:
         key="sap_datei",
     )
 
+# Wichtig: Ergebnisse dürfen nie zu zuvor hochgeladenen Dateien gehören.
+# Streamlit behält Session-State über Dateiwechsel hinweg; deshalb wird das
+# Ergebnis anhand des tatsächlichen Dateiinhalts eindeutig an beide Uploads gebunden.
+current_tour_fingerprint = uploaded_file_fingerprint(tourenplanung_datei)
+current_sap_fingerprint = uploaded_file_fingerprint(sap_datei)
+
+existing_result = st.session_state.get("fw_sap_compare_result")
+if existing_result:
+    result_tour_fp = existing_result.get("tour_fingerprint", "")
+    result_sap_fp = existing_result.get("sap_fingerprint", "")
+    if (
+        result_tour_fp != current_tour_fingerprint
+        or result_sap_fp != current_sap_fingerprint
+    ):
+        st.session_state.pop("fw_sap_compare_result", None)
+        existing_result = None
+        if tourenplanung_datei is not None or sap_datei is not None:
+            st.info("Eine Quelldatei oder SAP-Datei wurde geändert. Bitte den SAP-Abgleich neu erstellen.")
+
 run = st.button("SAP-Abgleich erstellen", type="primary", use_container_width=True)
 
 if run:
@@ -911,6 +938,8 @@ if run:
             "html_bytes": html_bytes,
             "tour_sheets": tour_sheets,
             "sap_sheet": sap_sheet,
+            "tour_fingerprint": current_tour_fingerprint,
+            "sap_fingerprint": current_sap_fingerprint,
         }
 
     except Exception as exc:
