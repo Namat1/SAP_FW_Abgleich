@@ -1,3 +1,5 @@
+import base64
+import html
 import io
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -390,9 +392,8 @@ def read_tourenplanung(
 
 
 # ---------------------------------------------------------------------------
-# EIN Vergleich: SAP gegen Tourenplanung
+# Vergleich + Gesamtübersicht
 # ---------------------------------------------------------------------------
-
 
 RESULT_COLUMNS = [
     "Blatt",
@@ -405,6 +406,21 @@ RESULT_COLUMNS = [
     "SAP-Abweichung",
 ]
 
+OVERVIEW_COLUMNS = [
+    "Blatt",
+    "SAP Nummer",
+    "Name",
+    "Straße",
+    "Ort",
+    "Tourenplanung (Soll)",
+    "SAP (Ist)",
+    "Fehlt in SAP",
+    "Zusätzlich in SAP",
+    "Status",
+    "_tour_days",
+    "_sap_days",
+]
+
 
 def build_sap_differences(
     tour_df: pd.DataFrame,
@@ -412,10 +428,7 @@ def build_sap_differences(
     sap_customers: Set[str],
     customer_info: Dict[str, Dict[str, str]],
 ) -> pd.DataFrame:
-    """
-    Die Tourenplanung hat immer Recht.
-    Es werden ausschließlich SAP-Abweichungen für Kunden aus der Tourenplanung gezeigt.
-    """
+    """Die Tourenplanung ist der Soll-Stand; SAP-Abweichungen werden vollständig gezeigt."""
     if tour_df.empty:
         return pd.DataFrame(columns=RESULT_COLUMNS)
 
@@ -425,12 +438,8 @@ def build_sap_differences(
     ).to_dict()
 
     rows: List[dict] = []
-
     for sap, expected_days in expected_by_sap.items():
         info = customer_info.get(sap, {})
-
-        # Nur diese Richtung wird bei der Kundenprüfung betrachtet:
-        # Tourendatei -> SAP. Kunden, die nur in SAP stehen, werden ignoriert.
         if sap not in sap_customers:
             rows.append({
                 "Blatt": sheets_by_sap.get(sap, ""),
@@ -445,9 +454,9 @@ def build_sap_differences(
             })
             continue
 
-        actual_days = days_by_sap.get(sap, set())
-        missing_in_sap = sorted(expected_days - actual_days)
-        extra_in_sap = sorted(actual_days - expected_days)
+        actual_days = set(days_by_sap.get(sap, set()))
+        missing_in_sap = sorted(set(expected_days) - actual_days)
+        extra_in_sap = sorted(actual_days - set(expected_days))
 
         if not missing_in_sap and not extra_in_sap:
             continue
@@ -478,23 +487,56 @@ def build_sap_differences(
     return result[RESULT_COLUMNS]
 
 
-def filter_result(df: pd.DataFrame, suche: str, blatt: str) -> pd.DataFrame:
-    if df.empty:
-        return df
+def build_customer_overview(
+    tour_df: pd.DataFrame,
+    days_by_sap: Dict[str, Set[int]],
+    sap_customers: Set[str],
+    customer_info: Dict[str, Dict[str, str]],
+) -> pd.DataFrame:
+    """Eine Zeile je Kunde aus der Quelldatei mit Soll/Ist direkt nebeneinander."""
+    if tour_df.empty:
+        return pd.DataFrame(columns=OVERVIEW_COLUMNS)
 
-    work = df
-    if blatt != "Alle":
-        work = work[work["Blatt"].astype(str).str.contains(blatt, na=False, regex=False)]
+    expected_by_sap: Dict[str, Set[int]] = tour_df.groupby("sap")["tag_num"].agg(set).to_dict()
+    sheets_by_sap: Dict[str, str] = tour_df.groupby("sap")["blatt"].agg(
+        lambda x: ", ".join(sorted(set(map(str, x))))
+    ).to_dict()
 
-    if suche.strip():
-        term = suche.strip().lower()
-        columns = ["SAP Nummer", "Name", "Straße", "Ort", "SAP-Abweichung"]
-        mask = pd.Series(False, index=work.index)
-        for column in columns:
-            mask = mask | work[column].astype(str).str.lower().str.contains(term, na=False)
-        work = work[mask]
+    rows: List[dict] = []
+    for sap, expected_days_raw in expected_by_sap.items():
+        expected_days = set(expected_days_raw)
+        exists = sap in sap_customers
+        actual_days = set(days_by_sap.get(sap, set())) if exists else set()
+        missing = expected_days - actual_days
+        extra = actual_days - expected_days
+        info = customer_info.get(sap, {})
 
-    return work
+        if not exists:
+            status = "Kunde fehlt in SAP"
+        elif missing or extra:
+            status = "Abweichung"
+        else:
+            status = "OK"
+
+        rows.append({
+            "Blatt": sheets_by_sap.get(sap, ""),
+            "SAP Nummer": str(sap),
+            "Name": info.get("name", ""),
+            "Straße": info.get("strasse", ""),
+            "Ort": info.get("ort", ""),
+            "Tourenplanung (Soll)": days_to_text(expected_days) or "–",
+            "SAP (Ist)": days_to_text(actual_days) if exists and actual_days else ("–" if exists else "Kunde fehlt"),
+            "Fehlt in SAP": days_to_text(missing) or "–",
+            "Zusätzlich in SAP": days_to_text(extra) or "–",
+            "Status": status,
+            "_tour_days": expected_days,
+            "_sap_days": actual_days,
+            "_sort": int(sap) if str(sap).isdigit() else 9_999_999_999,
+        })
+
+    result = pd.DataFrame(rows)
+    result = result.sort_values(["Blatt", "_sort"]).drop(columns=["_sort"]).reset_index(drop=True)
+    return result[OVERVIEW_COLUMNS]
 
 
 # ---------------------------------------------------------------------------
@@ -502,65 +544,294 @@ def filter_result(df: pd.DataFrame, suche: str, blatt: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def build_excel(result: pd.DataFrame) -> bytes:
+def build_excel(overview: pd.DataFrame, differences: pd.DataFrame) -> bytes:
     output = io.BytesIO()
+    overview_export = overview.drop(columns=["_tour_days", "_sap_days"], errors="ignore").copy()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        result.to_excel(writer, index=False, sheet_name="SAP Abweichungen", na_rep="")
-        ws = writer.sheets["SAP Abweichungen"]
+        overview_export.to_excel(writer, index=False, sheet_name="Gesamtübersicht", na_rep="")
+        differences.to_excel(writer, index=False, sheet_name="SAP Abweichungen", na_rep="")
 
         header_fill = PatternFill(start_color="FF2F3A4A", end_color="FF2F3A4A", fill_type="solid")
-        zebra_fill = PatternFill(start_color="FFF4F6F8", end_color="FFF4F6F8", fill_type="solid")
-        warning_fill = PatternFill(start_color="FFFFF0E5", end_color="FFFFF0E5", fill_type="solid")
+        ok_fill = PatternFill(start_color="FFEAF7F0", end_color="FFEAF7F0", fill_type="solid")
+        diff_fill = PatternFill(start_color="FFFFF7D6", end_color="FFFFF7D6", fill_type="solid")
+        missing_fill = PatternFill(start_color="FFFEE2E2", end_color="FFFEE2E2", fill_type="solid")
         thin = Side(style="thin", color="FFD7DEE8")
         border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFFFF")
-            cell.alignment = Alignment(vertical="center")
-            cell.border = border
-
-        for row_idx in range(2, len(result) + 2):
-            for col_idx in range(1, len(RESULT_COLUMNS) + 1):
-                cell = ws.cell(row=row_idx, column=col_idx)
-                cell.font = Font(name="Calibri", size=11)
-                cell.alignment = Alignment(vertical="center", wrap_text=False)
-                cell.border = border
-                if row_idx % 2 == 1:
-                    cell.fill = zebra_fill
-
-            # Abweichung optisch hervorheben
-            ws.cell(row=row_idx, column=RESULT_COLUMNS.index("SAP-Abweichung") + 1).fill = warning_fill
-
         width_hints = {
-            "Blatt": 18,
-            "SAP Nummer": 12,
-            "Name": 32,
-            "Straße": 26,
-            "Ort": 26,
-            "Tourenplanung (Soll)": 22,
-            "SAP (Ist)": 22,
-            "SAP-Abweichung": 38,
+            "Blatt": 18, "SAP Nummer": 13, "Name": 32, "Straße": 26, "Ort": 26,
+            "Tourenplanung (Soll)": 22, "SAP (Ist)": 22, "Fehlt in SAP": 20,
+            "Zusätzlich in SAP": 22, "Status": 20, "SAP-Abweichung": 38,
         }
-        for idx, column in enumerate(RESULT_COLUMNS, start=1):
-            ws.column_dimensions[get_column_letter(idx)].width = width_hints[column]
 
-        ws.freeze_panes = "A2"
-        if not result.empty:
-            ws.auto_filter.ref = f"A1:{get_column_letter(len(RESULT_COLUMNS))}{len(result) + 1}"
-        ws.sheet_view.showGridLines = False
-        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+        for sheet_name, df in [("Gesamtübersicht", overview_export), ("SAP Abweichungen", differences)]:
+            ws = writer.sheets[sheet_name]
+            columns = list(df.columns)
+
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFFFF")
+                cell.alignment = Alignment(vertical="center")
+                cell.border = border
+
+            for row_idx in range(2, len(df) + 2):
+                row_fill = diff_fill
+                if sheet_name == "Gesamtübersicht" and "Status" in columns:
+                    status = str(ws.cell(row=row_idx, column=columns.index("Status") + 1).value or "")
+                    if status == "OK":
+                        row_fill = ok_fill
+                    elif status == "Kunde fehlt in SAP":
+                        row_fill = missing_fill
+                for col_idx in range(1, len(columns) + 1):
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    cell.font = Font(name="Calibri", size=10)
+                    cell.alignment = Alignment(vertical="center", wrap_text=False)
+                    cell.border = border
+                    cell.fill = row_fill
+
+            for idx, column in enumerate(columns, start=1):
+                ws.column_dimensions[get_column_letter(idx)].width = width_hints.get(column, 20)
+
+            ws.freeze_panes = "A2"
+            if columns:
+                ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(df) + 1}"
+            ws.sheet_view.showGridLines = False
+            ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
 
     return output.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# HTML: alle Kunden, Tour/Quelldatei und SAP nebeneinander
+# ---------------------------------------------------------------------------
+
+
+def build_html_report(
+    overview: pd.DataFrame,
+    differences: pd.DataFrame,
+    sap_sheet: str,
+    tour_sheets: List[str],
+    excel_bytes: bytes,
+) -> bytes:
+    excel_b64 = base64.b64encode(excel_bytes).decode("ascii")
+    total_count = len(overview)
+    diff_count = len(differences)
+    ok_count = max(total_count - diff_count, 0)
+    missing_customer_count = int((overview["Status"] == "Kunde fehlt in SAP").sum()) if not overview.empty else 0
+    extra_customer_count = 0
+    if not overview.empty:
+        extra_customer_count = sum(bool(set(row["_sap_days"]) - set(row["_tour_days"])) for _, row in overview.iterrows())
+
+    def day_badges(days: Set[int], missing: Set[int] | None = None, extra: Set[int] | None = None, mode: str = "tour") -> str:
+        missing = missing or set()
+        extra = extra or set()
+        if not days:
+            return "<span class='none'>–</span>"
+        parts: List[str] = []
+        for day in sorted(days):
+            label = DAY_SHORT.get(day, str(day))
+            if day in missing:
+                parts.append(f"<span class='day day-missing' title='Fehlt in SAP'>{label}</span>")
+            elif day in extra:
+                parts.append(f"<span class='day day-extra' title='Zusätzlich in SAP'>+{label}</span>")
+            elif mode == "sap":
+                parts.append(f"<span class='day day-sap'>{label}</span>")
+            else:
+                parts.append(f"<span class='day day-tour'>{label}</span>")
+        return "".join(parts)
+
+    row_html: List[str] = []
+    for _, row in overview.iterrows():
+        tour_days = set(row.get("_tour_days", set()))
+        sap_days = set(row.get("_sap_days", set()))
+        missing = tour_days - sap_days
+        extra = sap_days - tour_days
+        status = str(row.get("Status", ""))
+        filter_status = "ok" if status == "OK" else "diff"
+        status_cls = "badge-ok" if status == "OK" else ("badge-missing" if status == "Kunde fehlt in SAP" else "badge-diff")
+        row_cls = "row-ok" if status == "OK" else "row-diff"
+
+        tour_html = day_badges(tour_days, missing=missing, mode="tour")
+        sap_html = day_badges(sap_days, extra=extra, mode="sap")
+        missing_html = day_badges(missing, missing=missing) if missing else "<span class='none'>–</span>"
+        extra_html = day_badges(extra, extra=extra) if extra else "<span class='none'>–</span>"
+
+        row_html.append(
+            f"<tr class='{row_cls}' data-status='{filter_status}'>"
+            f"<td><span class='area'>{html.escape(str(row.get('Blatt', '')))}</span></td>"
+            f"<td class='mono'>{html.escape(str(row.get('SAP Nummer', '')))}</td>"
+            f"<td class='name'>{html.escape(str(row.get('Name', '')))}</td>"
+            f"<td>{html.escape(str(row.get('Straße', '')))}</td>"
+            f"<td>{html.escape(str(row.get('Ort', '')))}</td>"
+            f"<td class='days-cell'><div class='source-label tour-label'>QUELLE</div><div class='days'>{tour_html}</div></td>"
+            f"<td class='days-cell'><div class='source-label sap-label'>SAP</div><div class='days'>{sap_html}</div></td>"
+            f"<td class='days-cell'><div class='days'>{missing_html}</div></td>"
+            f"<td class='days-cell'><div class='days'>{extra_html}</div></td>"
+            f"<td><span class='status-badge {status_cls}'>{html.escape(status)}</span></td>"
+            "</tr>"
+        )
+
+    sheet_chips = "".join(f"<span class='chip'>{html.escape(str(s))}</span>" for s in tour_sheets)
+    table = f"""
+    <div class='table-wrap'>
+      <table id='resultTable'>
+        <thead><tr>
+          <th>Blatt</th><th>SAP Nummer</th><th>Kunde</th><th>Straße</th><th>Ort</th>
+          <th class='tour-head'>Quelldatei / Soll</th><th class='sap-head'>SAP / Ist</th>
+          <th>Fehlt in SAP</th><th>Zusätzlich in SAP</th><th>Status</th>
+        </tr></thead>
+        <tbody>{''.join(row_html)}</tbody>
+      </table>
+    </div>
+    """
+
+    report = f"""<!doctype html>
+<html lang='de'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>FW SAP – Quelldatei Abgleich</title>
+<style>
+:root {{
+  --bg:#f5f6f8; --card:#fff; --text:#20242d; --muted:#667085; --line:#e2e5ea;
+  --tour:#5b45a6; --tour-bg:#eeeafd; --sap:#176a47; --sap-bg:#e8f6ee;
+  --bad:#b42318; --bad-bg:#feecea; --extra:#9a5b00; --extra-bg:#fff0cf; --extra-border:#f59e0b;
+  --warn:#8a5a00; --warn-bg:#fff7dd;
+}}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter,Segoe UI,Arial,sans-serif; }}
+.page {{ max-width:1780px; margin:0 auto; padding:30px 26px 48px; }}
+.header {{ display:flex; justify-content:space-between; align-items:flex-start; gap:20px; margin-bottom:20px; }}
+.eyebrow {{ font-size:12px; font-weight:900; letter-spacing:.10em; color:var(--tour); text-transform:uppercase; }}
+h1 {{ margin:7px 0 7px; font-size:32px; line-height:1.1; }}
+.subtitle {{ color:var(--muted); max-width:920px; line-height:1.5; }}
+.download {{ text-decoration:none; color:#fff; background:#272b35; border-radius:12px; padding:13px 17px; font-weight:800; white-space:nowrap; }}
+.grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:18px 0; }}
+.card {{ background:var(--card); border:1px solid var(--line); border-radius:15px; padding:15px 17px; box-shadow:0 3px 12px rgba(20,30,50,.035); }}
+.metric-label {{ color:var(--muted); font-size:12px; font-weight:750; }}
+.metric-value {{ font-size:28px; font-weight:900; margin:4px 0; }}
+.metric-note {{ color:var(--muted); font-size:11px; }}
+.info {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:9px; }}
+.chip {{ background:#f0eef9; color:#443589; border-radius:999px; padding:6px 10px; font-size:12px; font-weight:750; }}
+.section-head {{ display:flex; justify-content:space-between; align-items:flex-end; gap:16px; margin:28px 0 12px; }}
+.section-title {{ margin:0; font-size:21px; }}
+.legend {{ display:flex; flex-wrap:wrap; gap:9px; color:var(--muted); font-size:12px; }}
+.legend-item {{ display:inline-flex; align-items:center; gap:5px; }}
+.legend-dot {{ width:10px; height:10px; border-radius:50%; }}
+.legend-tour {{ background:var(--tour); }} .legend-sap {{ background:var(--sap); }} .legend-missing {{ background:var(--bad); }} .legend-extra {{ background:var(--extra-border); }}
+.toolbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; margin:12px 0 10px; flex-wrap:wrap; }}
+.search {{ flex:1 1 420px; max-width:680px; border:1px solid var(--line); background:#fff; border-radius:12px; padding:12px 14px; font-size:14px; outline:none; }}
+.filters {{ display:flex; gap:7px; flex-wrap:wrap; }}
+.filter-btn {{ border:1px solid var(--line); background:#fff; color:var(--text); border-radius:999px; padding:9px 13px; font-weight:800; cursor:pointer; }}
+.filter-btn.active {{ background:#272b35; border-color:#272b35; color:#fff; }}
+.result-count {{ color:var(--muted); font-size:13px; font-weight:800; }}
+.table-wrap {{ overflow:visible; max-height:none; background:var(--card); border:1px solid var(--line); border-radius:16px; box-shadow:0 3px 12px rgba(20,30,50,.04); }}
+table {{ width:100%; border-collapse:separate; border-spacing:0; table-layout:auto; }}
+th {{ position:sticky; top:0; z-index:2; background:#252a36; color:#fff; text-align:left; font-size:11px; padding:12px 9px; }}
+th:first-child {{ border-top-left-radius:15px; }} th:last-child {{ border-top-right-radius:15px; }}
+th.tour-head {{ background:#53419c; }} th.sap-head {{ background:#176a47; }}
+td {{ padding:10px 9px; border-top:1px solid var(--line); font-size:12px; vertical-align:middle; background:#fff; }}
+tr.row-diff td {{ background:#fffcf5; }} tbody tr:hover td {{ background:#faf9fe; }}
+.name {{ font-weight:800; min-width:150px; }} .mono {{ font-variant-numeric:tabular-nums; font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }}
+.area {{ display:inline-block; background:#f0f2f5; border-radius:999px; padding:5px 8px; font-weight:800; }}
+.days {{ display:flex; gap:4px; flex-wrap:wrap; align-items:center; }} .source-label {{ font-size:9px; font-weight:950; letter-spacing:.08em; margin-bottom:4px; }}
+.tour-label {{ color:var(--tour); }} .sap-label {{ color:var(--sap); }}
+.day {{ min-width:30px; height:27px; display:inline-flex; align-items:center; justify-content:center; border-radius:7px; font-weight:900; font-size:11px; border:1px solid transparent; }}
+.day-tour {{ background:var(--tour-bg); color:#4d3a9b; border-color:#d9d1f4; }}
+.day-sap {{ background:var(--sap-bg); color:var(--sap); border-color:#b7e2c9; }}
+.day-missing {{ background:var(--bad-bg); color:var(--bad); border-color:#f5bbb5; }}
+.day-extra {{ background:var(--extra-bg); color:var(--extra); border:2px solid var(--extra-border); font-weight:950; }}
+.none {{ color:#a0a7b2; }}
+.status-badge {{ display:inline-flex; border-radius:999px; padding:6px 9px; font-size:10px; font-weight:900; white-space:nowrap; }}
+.badge-ok {{ background:var(--sap-bg); color:var(--sap); }} .badge-diff {{ background:var(--warn-bg); color:var(--warn); }} .badge-missing {{ background:var(--bad-bg); color:var(--bad); }}
+.footer {{ color:var(--muted); font-size:12px; margin-top:24px; text-align:center; }}
+@media(max-width:1100px) {{ .grid{{grid-template-columns:repeat(2,1fr)}} th,td{{font-size:10px;padding:8px 6px}} .day{{min-width:26px;height:24px;font-size:10px}} }}
+@media(max-width:760px) {{ .page{{padding:18px 10px 30px}} .header{{flex-direction:column}} .download{{width:100%;text-align:center}} .grid{{grid-template-columns:1fr}} .section-head{{flex-direction:column;align-items:flex-start}} }}
+</style>
+</head>
+<body>
+<div class='page'>
+  <div class='header'>
+    <div>
+      <div class='eyebrow'>FW SAP · Quelldatei Abgleich</div>
+      <h1>FW SAP – Quelldatei Abgleich</h1>
+      <div class='subtitle'>Die Quelldatei ist der Soll-Stand. Alle Kunden werden vollständig dargestellt; Soll-Liefertage und SAP-Ist-Liefertage stehen direkt nebeneinander.</div>
+    </div>
+    <a class='download' href='data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{excel_b64}' download='FW_SAP_Quelldatei_Abgleich.xlsx'>Excel herunterladen</a>
+  </div>
+
+  <div class='grid'>
+    <div class='card'><div class='metric-label'>Geprüfte Kunden</div><div class='metric-value'>{total_count}</div><div class='metric-note'>aus der Quelldatei</div></div>
+    <div class='card'><div class='metric-label'>Ohne Abweichung</div><div class='metric-value'>{ok_count}</div><div class='metric-note'>Soll und SAP identisch</div></div>
+    <div class='card'><div class='metric-label'>Mit Abweichung</div><div class='metric-value'>{diff_count}</div><div class='metric-note'>fehlende oder zusätzliche SAP-Tage</div></div>
+    <div class='card'><div class='metric-label'>Zusätzliche SAP-Tage</div><div class='metric-value'>{extra_customer_count}</div><div class='metric-note'>Kunden mit mindestens einem Extra-Tag</div></div>
+  </div>
+
+  <div class='card'>
+    <div class='metric-label'>Geprüfte Datenbasis</div>
+    <div style='margin-top:5px'><b>SAP-Blatt:</b> {html.escape(str(sap_sheet))}</div>
+    <div class='info'>{sheet_chips}</div>
+    <div style='margin-top:10px;color:var(--muted);font-size:12px'>Kunden, die nur in SAP stehen, werden weiterhin ignoriert. Fehlende Soll-Tage sind rot; zusätzliche SAP-Tage sind deutlich orange und mit <b>+</b> gekennzeichnet. Kunden, die komplett in SAP fehlen: <b>{missing_customer_count}</b>.</div>
+  </div>
+
+  <div class='section-head'>
+    <h2 class='section-title'>Alle Kunden – Quelldatei und SAP nebeneinander</h2>
+    <div class='legend'>
+      <span class='legend-item'><i class='legend-dot legend-tour'></i> Quelldatei / Soll</span>
+      <span class='legend-item'><i class='legend-dot legend-sap'></i> SAP passend</span>
+      <span class='legend-item'><i class='legend-dot legend-missing'></i> fehlt in SAP</span>
+      <span class='legend-item'><i class='legend-dot legend-extra'></i> + zusätzlich in SAP</span>
+    </div>
+  </div>
+
+  <div class='toolbar'>
+    <input id='searchInput' class='search' type='search' placeholder='SAP Nummer, Kunde, Straße, Ort, Blatt oder Liefertag suchen …' oninput='applyFilters()'>
+    <div class='filters'>
+      <button class='filter-btn active' onclick="setFilter('all',this)">Alle</button>
+      <button class='filter-btn' onclick="setFilter('diff',this)">Nur Abweichungen</button>
+      <button class='filter-btn' onclick="setFilter('ok',this)">Nur OK</button>
+    </div>
+    <span id='resultCount' class='result-count'></span>
+  </div>
+
+  {table}
+  <div class='footer'>Erstellt mit „FW SAP – Quelldatei Abgleich“</div>
+</div>
+<script>
+let activeFilter='all';
+function setFilter(filter,button){{
+  activeFilter=filter;
+  document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+  if(button) button.classList.add('active');
+  applyFilters();
+}}
+function applyFilters(){{
+  const table=document.getElementById('resultTable');
+  if(!table) return;
+  const term=(document.getElementById('searchInput').value||'').toLowerCase().trim();
+  let visible=0;
+  for(const row of table.tBodies[0].rows){{
+    const showText=row.innerText.toLowerCase().includes(term);
+    const showStatus=activeFilter==='all'||row.dataset.status===activeFilter;
+    const show=showText&&showStatus;
+    row.style.display=show?'':'none';
+    if(show) visible++;
+  }}
+  document.getElementById('resultCount').textContent=visible+' von '+table.tBodies[0].rows.length;
+}}
+applyFilters();
+</script>
+</body>
+</html>"""
+    return report.encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
 # Streamlit-Oberfläche
 # ---------------------------------------------------------------------------
 
-
-st.set_page_config(page_title="SAP-Abgleich zur Tourenplanung", layout="wide")
+st.set_page_config(page_title="FW SAP – Quelldatei Abgleich", layout="wide")
 
 st.markdown(
     """
@@ -575,14 +846,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("SAP-Abgleich zur Tourenplanung")
+st.title("FW SAP – Quelldatei Abgleich")
 st.markdown(
     """
     <div class="hint">
-    <b>Grundlage ist ausschließlich die Tourenplanung.</b><br>
-    Die Tourenplanung ist der Soll-Stand. Angezeigt wird nur, wo <b>SAP davon abweicht</b>.
-    Zusätzlich wird geprüft, ob <b>jeder Kunde aus der Tourendatei überhaupt in SAP vorhanden ist</b>.
-    Geprüft wird nur Tourendatei → SAP; Kunden, die nur in SAP stehen, werden ignoriert.
+    <b>Grundlage ist ausschließlich die Quelldatei / Tourenplanung.</b><br>
+    Sie ist der Soll-Stand. SAP wird dagegen geprüft. Dabei werden fehlende und zusätzliche SAP-Liefertage sowie komplett fehlende Kunden erkannt.
+    Kunden, die nur in SAP stehen, werden ignoriert.
     </div>
     """,
     unsafe_allow_html=True,
@@ -593,7 +863,7 @@ st.divider()
 upload_left, upload_right = st.columns(2)
 with upload_left:
     tourenplanung_datei = st.file_uploader(
-        "1. Tourenplanung (Soll)",
+        "1. Quelldatei / Tourenplanung (Soll)",
         help="Diese Datei hat Vorrang und definiert die richtigen Liefertage.",
         type=["xlsx", "xlsm", "xls"],
         key="tourenplanung_datei",
@@ -602,16 +872,16 @@ with upload_left:
 with upload_right:
     sap_datei = st.file_uploader(
         "2. SAP-Datei (Ist)",
-        help="SAP wird ausschließlich gegen die Tourenplanung geprüft.",
+        help="SAP wird gegen die Quelldatei geprüft.",
         type=["xlsx", "xlsm", "xls"],
         key="sap_datei",
     )
 
-run = st.button("SAP-Abweichungen prüfen", type="primary", use_container_width=True)
+run = st.button("SAP-Abgleich erstellen", type="primary", use_container_width=True)
 
 if run:
     if not sap_datei or not tourenplanung_datei:
-        st.error("Bitte Tourenplanung und SAP-Datei hochladen.")
+        st.error("Bitte Quelldatei und SAP-Datei hochladen.")
         st.stop()
 
     try:
@@ -619,22 +889,26 @@ if run:
         days_by_sap, sap_customers, sap_sheet, sap_rows = read_sap_file(sap_datei)
 
         if tour_df.empty:
-            st.error("In der Tourenplanung wurden keine gültigen Liefertage erkannt.")
+            st.error("In der Quelldatei wurden keine gültigen Liefertage erkannt.")
             st.stop()
         if sap_rows == 0:
             st.warning("In der SAP-Datei wurden keine gültigen Liefertage erkannt.")
         if missing_tour_sheets:
-            st.warning("Nicht gefundene Touren-Blätter: " + ", ".join(missing_tour_sheets))
+            st.warning("Nicht gefundene Quelldatei-Blätter: " + ", ".join(missing_tour_sheets))
 
         differences = build_sap_differences(tour_df, days_by_sap, sap_customers, customer_info)
-        excel_bytes = build_excel(differences)
+        overview = build_customer_overview(tour_df, days_by_sap, sap_customers, customer_info)
+        excel_bytes = build_excel(overview, differences)
+        html_bytes = build_html_report(overview, differences, sap_sheet, tour_sheets, excel_bytes)
 
-        missing_customers = int((differences["SAP-Abweichung"] == "Kunde fehlt in SAP").sum()) if not differences.empty else 0
+        missing_customers = int((overview["Status"] == "Kunde fehlt in SAP").sum()) if not overview.empty else 0
 
-        st.session_state["sap_compare_result"] = {
+        st.session_state["fw_sap_compare_result"] = {
             "differences": differences,
+            "overview": overview,
             "missing_customers": missing_customers,
             "excel_bytes": excel_bytes,
+            "html_bytes": html_bytes,
             "tour_sheets": tour_sheets,
             "sap_sheet": sap_sheet,
         }
@@ -644,70 +918,42 @@ if run:
         st.error(f"Fehler beim Verarbeiten der Dateien: {exc}")
         with st.expander("Technische Details", expanded=False):
             st.code(traceback.format_exc(), language="python")
-        st.session_state.pop("sap_compare_result", None)
+        st.session_state.pop("fw_sap_compare_result", None)
 
 
-result = st.session_state.get("sap_compare_result")
+result = st.session_state.get("fw_sap_compare_result")
 if result:
     differences = result["differences"]
+    overview = result["overview"]
 
     st.divider()
-    header_left, header_right = st.columns([3, 1])
-    with header_left:
-        st.subheader("SAP-Abweichungen")
-        st.caption(
-            "Nur Abweichungen von der Tourenplanung werden angezeigt. "
-            "Die Tourenplanung ist immer der Soll-Stand."
+    st.subheader("Auswertung erstellt")
+    st.caption("Die HTML-Datei enthält die vollständige optische Auswertung und den Excel-Download direkt in der Datei.")
+
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "HTML-Auswertung herunterladen",
+            data=result["html_bytes"],
+            file_name="FW_SAP_Quelldatei_Abgleich.html",
+            mime="text/html",
+            use_container_width=True,
         )
-    with header_right:
+    with d2:
         st.download_button(
             "Excel herunterladen",
             data=result["excel_bytes"],
-            file_name="SAP_Abweichungen_zur_Tourenplanung.xlsx",
+            file_name="FW_SAP_Quelldatei_Abgleich.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
 
-    m1, m2 = st.columns(2)
-    m1.metric("SAP-Abweichungen", len(differences))
-    m2.metric("Kunden fehlen in SAP", result.get("missing_customers", 0))
-
-    if result.get("missing_customers", 0) == 0:
-        st.success("Alle Kunden aus der Tourendatei sind in SAP vorhanden.")
-    else:
-        st.error(f"{result['missing_customers']} Kunde(n) aus der Tourendatei fehlen komplett in SAP.")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Geprüfte Kunden", len(overview))
+    m2.metric("SAP-Abweichungen", len(differences))
+    m3.metric("Kunden fehlen in SAP", result.get("missing_customers", 0))
 
     if differences.empty:
-        st.success("Keine Abweichungen: SAP stimmt mit der Tourenplanung überein.")
+        st.success("Keine Abweichungen: SAP stimmt mit der Quelldatei überein.")
     else:
-        f1, f2 = st.columns([1, 2])
-        with f1:
-            blatt_options = ["Alle"] + sorted(
-                set(
-                    sheet
-                    for cell in differences["Blatt"].dropna().astype(str)
-                    for sheet in [s.strip() for s in cell.split(",")]
-                    if sheet
-                )
-            )
-            blatt = st.selectbox("Blatt", blatt_options)
-        with f2:
-            suche = st.text_input(
-                "Suchen",
-                placeholder="SAP Nummer, Name, Straße, Ort oder Abweichung",
-            )
-
-        filtered = filter_result(differences, suche, blatt)
-        st.caption(f"{len(filtered)} Abweichungen")
-        st.dataframe(
-            filtered,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "SAP Nummer": st.column_config.TextColumn(width="small"),
-                "Blatt": st.column_config.TextColumn(width="small"),
-                "Tourenplanung (Soll)": st.column_config.TextColumn(width="medium"),
-                "SAP (Ist)": st.column_config.TextColumn(width="medium"),
-                "SAP-Abweichung": st.column_config.TextColumn(width="large"),
-            },
-        )
+        st.warning(f"{len(differences)} Kunde(n) mit SAP-Abweichung gefunden. Für die vollständige Übersicht bitte die HTML-Auswertung öffnen.")
