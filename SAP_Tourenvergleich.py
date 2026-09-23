@@ -1,6 +1,7 @@
 import base64
 import html
 import io
+import json
 import hashlib
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -694,6 +695,55 @@ def build_html_report(
     </div>
     """
 
+
+    graph_nodes: List[dict] = [{
+        "id": "root", "type": "root", "label": "FW SAP", "status": "root",
+        "name": "FW SAP – Quelldatei Abgleich", "group": "", "sap": "", "source": "", "sap_days": "",
+        "missing": "", "extra": "", "detail_status": "Gesamtauswertung", "parent": ""
+    }]
+    graph_edges: List[dict] = []
+    graph_groups: Dict[str, str] = {}
+
+    for graph_index, (_, graph_row) in enumerate(overview.iterrows()):
+        graph_tour_days = set(graph_row.get("_tour_days", set()))
+        graph_sap_days = set(graph_row.get("_sap_days", set()))
+        graph_missing = graph_tour_days - graph_sap_days
+        graph_extra = graph_sap_days - graph_tour_days
+        graph_status_text = str(graph_row.get("Status", ""))
+        graph_status = "missing" if (graph_status_text == "Kunde fehlt in SAP" or graph_missing) else ("extra" if graph_extra else "ok")
+
+        graph_group_names = [part.strip() for part in str(graph_row.get("Blatt", "")).split(",") if part.strip()]
+        if not graph_group_names:
+            graph_group_names = ["Ohne Blatt"]
+        graph_group_ids: List[str] = []
+        for graph_group_name in graph_group_names:
+            if graph_group_name not in graph_groups:
+                graph_group_id = f"group_{len(graph_groups)}"
+                graph_groups[graph_group_name] = graph_group_id
+                graph_nodes.append({
+                    "id": graph_group_id, "type": "group", "label": graph_group_name, "status": "group",
+                    "name": graph_group_name, "group": graph_group_name, "sap": "", "source": "",
+                    "sap_days": "", "missing": "", "extra": "", "detail_status": "Gruppe", "parent": "root"
+                })
+                graph_edges.append({"source": "root", "target": graph_group_id})
+            graph_group_ids.append(graph_groups[graph_group_name])
+
+        graph_customer_id = f"customer_{graph_index}"
+        graph_customer_name = str(graph_row.get("Name", "")).strip() or str(graph_row.get("SAP Nummer", "")).strip() or "Kunde"
+        graph_nodes.append({
+            "id": graph_customer_id, "type": "customer", "label": graph_customer_name, "status": graph_status,
+            "name": graph_customer_name, "group": ", ".join(graph_group_names),
+            "sap": str(graph_row.get("SAP Nummer", "")),
+            "source": days_to_text(graph_tour_days) or "–", "sap_days": days_to_text(graph_sap_days) or "–",
+            "missing": days_to_text(graph_missing) or "–", "extra": days_to_text(graph_extra) or "–",
+            "detail_status": graph_status_text, "parent": graph_group_ids[0]
+        })
+        for graph_group_id in graph_group_ids:
+            graph_edges.append({"source": graph_group_id, "target": graph_customer_id})
+
+    graph_json = json.dumps({"nodes": graph_nodes, "edges": graph_edges}, ensure_ascii=False)
+    graph_json = graph_json.replace("<", "\u003c").replace(">", "\u003e").replace("&", "\u0026")
+
     report = f"""<!doctype html>
 <html lang='de'>
 <head>
@@ -753,6 +803,36 @@ tr.row-diff td {{ background:#fffcf5; }} tbody tr:hover td {{ background:#faf9fe
 .none {{ color:#a0a7b2; }}
 .status-badge {{ display:inline-flex; border-radius:999px; padding:6px 9px; font-size:10px; font-weight:900; white-space:nowrap; }}
 .badge-ok {{ background:var(--sap-bg); color:var(--sap); }} .badge-diff {{ background:var(--warn-bg); color:var(--warn); }} .badge-missing {{ background:var(--bad-bg); color:var(--bad); }}
+
+.view-switch {{ display:flex; gap:8px; margin:14px 0 12px; flex-wrap:wrap; }}
+.view-btn {{ border:1px solid var(--line); background:#fff; color:var(--text); border-radius:11px; padding:10px 15px; font-weight:850; cursor:pointer; }}
+.view-btn.active {{ color:#fff; background:#272b35; border-color:#272b35; }}
+.view-panel.hidden {{ display:none; }}
+.graph-intro {{ display:flex; justify-content:space-between; gap:14px; align-items:center; margin:8px 0 12px; color:var(--muted); font-size:12px; flex-wrap:wrap; }}
+.graph-shell {{ position:relative; width:100%; min-height:760px; border-radius:18px; overflow:hidden; background:radial-gradient(circle at 50% 50%,#202534 0,#141821 42%,#0d1016 100%); border:1px solid #2c3342; box-shadow:0 12px 30px rgba(13,16,22,.16); }}
+#graphSvg {{ display:block; width:100%; height:760px; cursor:grab; user-select:none; touch-action:none; }}
+#graphSvg.panning {{ cursor:grabbing; }}
+.graph-edge {{ stroke:#697386; stroke-opacity:.30; stroke-width:1.1; }}
+.graph-node circle {{ stroke:#0d1016; stroke-width:2; transition:filter .12s ease; }}
+.graph-node:hover circle {{ filter:drop-shadow(0 0 7px rgba(255,255,255,.35)); }}
+.graph-node.root circle {{ fill:#8b5cf6; }}
+.graph-node.group circle {{ fill:#c4b5fd; }}
+.graph-node.ok circle {{ fill:#34d399; }}
+.graph-node.extra circle {{ fill:#f59e0b; }}
+.graph-node.missing circle {{ fill:#ef4444; }}
+.graph-label {{ fill:#e7eaf0; font-size:12px; font-weight:800; pointer-events:none; paint-order:stroke; stroke:#11141b; stroke-width:4px; stroke-linejoin:round; }}
+.graph-customer-label {{ fill:#f4f5f7; font-size:10px; opacity:0; pointer-events:none; paint-order:stroke; stroke:#11141b; stroke-width:3px; transition:opacity .12s; }}
+.graph-node:hover .graph-customer-label {{ opacity:1; }}
+.graph-detail {{ position:absolute; right:16px; top:16px; width:min(330px,calc(100% - 32px)); background:rgba(19,23,32,.94); color:#f6f7f9; border:1px solid #353d4d; border-radius:14px; padding:14px 15px; backdrop-filter:blur(10px); box-shadow:0 10px 28px rgba(0,0,0,.25); }}
+.graph-detail-title {{ font-size:16px; font-weight:900; margin-bottom:8px; }}
+.graph-detail-row {{ display:grid; grid-template-columns:92px 1fr; gap:8px; font-size:11px; line-height:1.45; padding:3px 0; }}
+.graph-detail-key {{ color:#9ca6b6; font-weight:800; }}
+.graph-help {{ position:absolute; left:14px; bottom:12px; color:#aab2c0; font-size:10px; background:rgba(13,16,22,.72); padding:7px 9px; border-radius:8px; }}
+.graph-legend {{ display:flex; flex-wrap:wrap; gap:10px; }}
+.graph-legend span {{ display:inline-flex; align-items:center; gap:5px; }}
+.graph-dot {{ width:9px; height:9px; border-radius:50%; display:inline-block; }}
+.graph-dot.ok {{ background:#34d399; }} .graph-dot.extra {{ background:#f59e0b; }} .graph-dot.missing {{ background:#ef4444; }} .graph-dot.group {{ background:#c4b5fd; }}
+
 .footer {{ color:var(--muted); font-size:12px; margin-top:24px; text-align:center; }}
 @media(max-width:1100px) {{ .grid{{grid-template-columns:repeat(2,1fr)}} th,td{{font-size:10px;padding:8px 6px}} .day{{min-width:26px;height:24px;font-size:10px}} }}
 @media(max-width:760px) {{ .page{{padding:18px 10px 30px}} .header{{flex-direction:column}} .download{{width:100%;text-align:center}} .grid{{grid-template-columns:1fr}} .section-head{{flex-direction:column;align-items:flex-start}} }}
@@ -793,6 +873,12 @@ tr.row-diff td {{ background:#fffcf5; }} tbody tr:hover td {{ background:#faf9fe
     </div>
   </div>
 
+  <div class='view-switch'>
+    <button id='tableViewBtn' class='view-btn active' onclick="showView('table')">Tabellenansicht</button>
+    <button id='graphViewBtn' class='view-btn' onclick="showView('graph')">Stern-Graph</button>
+  </div>
+
+  <div id='tableView' class='view-panel'>
   <div class='toolbar'>
     <input id='searchInput' class='search' type='search' placeholder='SAP Nummer, Kunde, Straße, Ort, Blatt oder Liefertag suchen …' oninput='applyFilters()'>
     <div class='filters'>
@@ -804,9 +890,36 @@ tr.row-diff td {{ background:#fffcf5; }} tbody tr:hover td {{ background:#faf9fe
   </div>
 
   {table}
+  </div>
+
+  <div id='graphView' class='view-panel hidden'>
+    <div class='graph-intro'>
+      <div><b>Obsidian-ähnlicher Stern-Graph:</b> Zentrum → Blatt → Kunde. Anklicken zeigt die Details.</div>
+      <div class='graph-legend'>
+        <span><i class='graph-dot group'></i> Blatt</span>
+        <span><i class='graph-dot ok'></i> OK</span>
+        <span><i class='graph-dot extra'></i> zusätzlicher SAP-Tag</span>
+        <span><i class='graph-dot missing'></i> fehlt in SAP</span>
+      </div>
+    </div>
+    <div class='graph-shell'>
+      <svg id='graphSvg' role='img' aria-label='Stern-Graph der SAP-Auswertung'>
+        <g id='graphViewport'><g id='graphEdges'></g><g id='graphNodes'></g></g>
+      </svg>
+      <div id='graphDetail' class='graph-detail'>
+        <div class='graph-detail-title'>Stern-Graph</div>
+        <div style='color:#aab2c0;font-size:11px;line-height:1.45'>Klicke einen Kunden an, um Soll-Tage, SAP-Tage und Abweichungen anzuzeigen.</div>
+      </div>
+      <div class='graph-help'>Mausrad: Zoom · Ziehen: Verschieben · Doppelklick: Ansicht zurücksetzen</div>
+    </div>
+  </div>
+
   <div class='footer'>Erstellt mit „FW SAP – Quelldatei Abgleich“</div>
 </div>
 <script>
+const GRAPH_DATA = {graph_json};
+let graphInitialized=false;
+let graphInitialViewBox=null;
 let activeFilter='all';
 function setFilter(filter,button){{
   activeFilter=filter;
@@ -828,6 +941,143 @@ function applyFilters(){{
   }}
   document.getElementById('resultCount').textContent=visible+' von '+table.tBodies[0].rows.length;
 }}
+
+function showView(view){{
+  const table=document.getElementById('tableView');
+  const graph=document.getElementById('graphView');
+  const tableBtn=document.getElementById('tableViewBtn');
+  const graphBtn=document.getElementById('graphViewBtn');
+  const showGraph=view==='graph';
+  table.classList.toggle('hidden',showGraph);
+  graph.classList.toggle('hidden',!showGraph);
+  tableBtn.classList.toggle('active',!showGraph);
+  graphBtn.classList.toggle('active',showGraph);
+  if(showGraph&&!graphInitialized){{ initGraph(); graphInitialized=true; }}
+}}
+function svgEl(name,attrs){{
+  const el=document.createElementNS('http://www.w3.org/2000/svg',name);
+  Object.entries(attrs||{{}}).forEach(function(pair){{el.setAttribute(pair[0],String(pair[1]));}});
+  return el;
+}}
+function setViewBox(svg,v){{
+  svg.setAttribute('viewBox',v.x+' '+v.y+' '+v.w+' '+v.h);
+  svg._vb={{x:v.x,y:v.y,w:v.w,h:v.h}};
+}}
+function initGraph(){{
+  const svg=document.getElementById('graphSvg');
+  const edgeLayer=document.getElementById('graphEdges');
+  const nodeLayer=document.getElementById('graphNodes');
+  if(!svg||!edgeLayer||!nodeLayer) return;
+  edgeLayer.innerHTML=''; nodeLayer.innerHTML='';
+  const nodes=GRAPH_DATA.nodes.map(function(n){{return Object.assign({{}},n);}});
+  const nodeMap=new Map(nodes.map(function(n){{return [n.id,n];}}));
+  const root=nodeMap.get('root');
+  if(!root) return;
+  root.x=0; root.y=0;
+  const groups=nodes.filter(function(n){{return n.type==='group';}});
+  const groupCount=Math.max(groups.length,1);
+  const groupRadius=230;
+  groups.forEach(function(g,i){{
+    const a=-Math.PI/2+(Math.PI*2*i/groupCount);
+    g.angle=a; g.x=Math.cos(a)*groupRadius; g.y=Math.sin(a)*groupRadius;
+  }});
+  const customersByParent=new Map();
+  nodes.filter(function(n){{return n.type==='customer';}}).forEach(function(n){{
+    if(!customersByParent.has(n.parent)) customersByParent.set(n.parent,[]);
+    customersByParent.get(n.parent).push(n);
+  }});
+  groups.forEach(function(g){{
+    const list=customersByParent.get(g.id)||[];
+    const wedge=Math.min(Math.PI*0.78,Math.PI*1.7/groupCount);
+    let start=0,ring=0;
+    while(start<list.length){{
+      const capacity=22+ring*8;
+      const current=list.slice(start,start+capacity);
+      const radius=105+ring*62;
+      current.forEach(function(n,j){{
+        const ratio=current.length===1?0.5:j/(current.length-1);
+        const a=g.angle-wedge/2+wedge*ratio;
+        n.x=g.x+Math.cos(a)*radius;
+        n.y=g.y+Math.sin(a)*radius;
+      }});
+      start+=capacity; ring++;
+    }}
+  }});
+  const positioned=nodes.filter(function(n){{return Number.isFinite(n.x)&&Number.isFinite(n.y);}});
+  const xs=positioned.map(function(n){{return n.x;}}),ys=positioned.map(function(n){{return n.y;}});
+  const minX=Math.min.apply(null,xs)-150,maxX=Math.max.apply(null,xs)+220,minY=Math.min.apply(null,ys)-150,maxY=Math.max.apply(null,ys)+150;
+  graphInitialViewBox={{x:minX,y:minY,w:Math.max(600,maxX-minX),h:Math.max(450,maxY-minY)}};
+  setViewBox(svg,graphInitialViewBox);
+  GRAPH_DATA.edges.forEach(function(e){{
+    const a=nodeMap.get(e.source),b=nodeMap.get(e.target);
+    if(!a||!b) return;
+    edgeLayer.appendChild(svgEl('line',{{x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:'graph-edge'}}));
+  }});
+  nodes.forEach(function(n){{
+    const g=svgEl('g',{{class:'graph-node '+n.type+' '+n.status,transform:'translate('+n.x+' '+n.y+')'}});
+    const radius=n.type==='root'?24:(n.type==='group'?14:6);
+    g.appendChild(svgEl('circle',{{r:radius}}));
+    const title=svgEl('title',{{}}); title.textContent=n.name||n.label; g.appendChild(title);
+    if(n.type!=='customer'){{
+      const t=svgEl('text',{{x:radius+8,y:4,class:'graph-label'}}); t.textContent=n.label; g.appendChild(t);
+    }}else{{
+      const t=svgEl('text',{{x:10,y:4,class:'graph-customer-label'}}); t.textContent=n.label; g.appendChild(t);
+    }}
+    g.addEventListener('click',function(ev){{ev.stopPropagation();showGraphDetail(n);}});
+    nodeLayer.appendChild(g);
+  }});
+  setupPanZoom(svg);
+}}
+function setupPanZoom(svg){{
+  if(svg._panZoomReady) return; svg._panZoomReady=true;
+  let dragging=false,start=null,startVB=null;
+  svg.addEventListener('wheel',function(e){{
+    e.preventDefault();
+    const vb=svg._vb||graphInitialViewBox,rect=svg.getBoundingClientRect();
+    const px=(e.clientX-rect.left)/rect.width,py=(e.clientY-rect.top)/rect.height,scale=e.deltaY>0?1.12:0.89;
+    const nw=vb.w*scale,nh=vb.h*scale;
+    setViewBox(svg,{{x:vb.x+(vb.w-nw)*px,y:vb.y+(vb.h-nh)*py,w:nw,h:nh}});
+  }},{{passive:false}});
+  svg.addEventListener('pointerdown',function(e){{
+    if(e.button!==0) return; dragging=true; start={{x:e.clientX,y:e.clientY}}; startVB=Object.assign({{}},svg._vb||graphInitialViewBox); svg.classList.add('panning'); svg.setPointerCapture(e.pointerId);
+  }});
+  svg.addEventListener('pointermove',function(e){{
+    if(!dragging) return;
+    const rect=svg.getBoundingClientRect(),dx=(e.clientX-start.x)*startVB.w/rect.width,dy=(e.clientY-start.y)*startVB.h/rect.height;
+    setViewBox(svg,{{x:startVB.x-dx,y:startVB.y-dy,w:startVB.w,h:startVB.h}});
+  }});
+  svg.addEventListener('pointerup',function(){{dragging=false;svg.classList.remove('panning');}});
+  svg.addEventListener('pointercancel',function(){{dragging=false;svg.classList.remove('panning');}});
+  svg.addEventListener('dblclick',function(){{if(graphInitialViewBox)setViewBox(svg,graphInitialViewBox);}});
+}}
+function escGraph(v){{
+  return String(v==null?'':v).replace(/[&<>\"]/g,function(c){{return {{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}}[c];}});
+}}
+function showGraphDetail(n){{
+  const box=document.getElementById('graphDetail');
+  if(!box) return;
+  if(n.type==='root'){{
+    const customers=GRAPH_DATA.nodes.filter(function(x){{return x.type==='customer';}}).length;
+    const groups=GRAPH_DATA.nodes.filter(function(x){{return x.type==='group';}}).length;
+    box.innerHTML="<div class='graph-detail-title'>"+escGraph(n.name)+"</div><div style='color:#aab2c0;font-size:11px'>"+customers+" Kunden · "+groups+" Gruppen</div>";
+    return;
+  }}
+  if(n.type==='group'){{
+    const count=GRAPH_DATA.edges.filter(function(e){{return e.source===n.id&&String(e.target).indexOf('customer_')===0;}}).length;
+    box.innerHTML="<div class='graph-detail-title'>"+escGraph(n.name)+"</div><div class='graph-detail-row'><span class='graph-detail-key'>Typ</span><span>Blatt</span></div><div class='graph-detail-row'><span class='graph-detail-key'>Kunden</span><span>"+count+"</span></div>";
+    return;
+  }}
+  const colorLabel=n.status==='missing'?'Fehlt in SAP / Liefertag fehlt':(n.status==='extra'?'Zusätzlicher SAP-Tag':'OK');
+  box.innerHTML="<div class='graph-detail-title'>"+escGraph(n.name)+"</div>"+
+    "<div class='graph-detail-row'><span class='graph-detail-key'>SAP</span><span>"+escGraph(n.sap)+"</span></div>"+
+    "<div class='graph-detail-row'><span class='graph-detail-key'>Blatt</span><span>"+escGraph(n.group)+"</span></div>"+
+    "<div class='graph-detail-row'><span class='graph-detail-key'>Soll-Tage</span><span>"+escGraph(n.source)+"</span></div>"+
+    "<div class='graph-detail-row'><span class='graph-detail-key'>SAP-Tage</span><span>"+escGraph(n.sap_days)+"</span></div>"+
+    "<div class='graph-detail-row'><span class='graph-detail-key'>Fehlt</span><span>"+escGraph(n.missing)+"</span></div>"+
+    "<div class='graph-detail-row'><span class='graph-detail-key'>Zusätzlich</span><span>"+escGraph(n.extra)+"</span></div>"+
+    "<div class='graph-detail-row'><span class='graph-detail-key'>Bewertung</span><span>"+escGraph(colorLabel)+"</span></div>";
+}}
+
 applyFilters();
 </script>
 </body>
